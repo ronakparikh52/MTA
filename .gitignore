@@ -10,3 +10,7 @@ __pycache__/
 .DS_Store
 .idea/
 .vscode/
+
+# Runtime logs
+backend_perf.log
+*.log

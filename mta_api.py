@@ -22,6 +22,7 @@ from __future__ import annotations
 import os
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from typing import Iterable
 
@@ -79,14 +80,19 @@ class Departure:
     next_train_minutes: int | None = None  # following train at same stop+dir
 
 
+# Module-level tables so direction helpers don't rebuild a dict per call.
+_DIRECTION_LABELS = {"N": "Uptown", "S": "Downtown"}
+_DIRECTION_LETTERS = {"N": "U", "S": "D"}
+
+
 def direction_label(direction: str) -> str:
     """Long label: 'Uptown' / 'Downtown'."""
-    return {"N": "Uptown", "S": "Downtown"}.get(direction, direction)
+    return _DIRECTION_LABELS.get(direction, direction)
 
 
 def direction_letter(direction: str) -> str:
     """Short label: 'U' / 'D'."""
-    return {"N": "U", "S": "D"}.get(direction, direction)
+    return _DIRECTION_LETTERS.get(direction, direction)
 
 
 # ---------------------------------------------------------------------------
@@ -147,7 +153,8 @@ def format_departure_terminal(
     route = f"{d.route_id:<{width}}"
     if use_color:
         r, g, b = line_rgb(d.route_id)
-        route = f"\033[1m\033[38;2;{r};{g};{b}m{route}\033[0m"
+        # Single combined SGR sequence = one fewer escape pair per row.
+        route = f"\033[1;38;2;{r};{g};{b}m{route}\033[0m"
 
     return f"  {route}  {direction_letter(d.direction)}   {d.minutes_away:>2}   {nxt:>2}"
 
@@ -156,26 +163,40 @@ def format_departure_terminal(
 # Fetch + parse
 # ---------------------------------------------------------------------------
 
+# Shared HTTP session: one TCP+TLS connection stays warm between polls, which
+# is the single biggest win on a Pi Zero 2 W where TLS handshakes are costly.
+# `requests` keeps a connection pool per host when you reuse a Session.
+_SESSION = requests.Session()
+_SESSION.headers.update({
+    "Accept-Encoding": "gzip, deflate",  # MTA gzips feeds; saves bandwidth + CPU.
+    "User-Agent": "mta-led-sign/1.0",
+})
+
+
 def fetch_feed(feed_key: str, timeout: float = 10.0) -> gtfs_realtime_pb2.FeedMessage:
     """Download one MTA feed and decode it into a protobuf FeedMessage."""
-    response = requests.get(FEED_URLS[feed_key], timeout=timeout)
+    response = _SESSION.get(FEED_URLS[feed_key], timeout=timeout)
     response.raise_for_status()
     feed = gtfs_realtime_pb2.FeedMessage()
     feed.ParseFromString(response.content)
     return feed
 
 
+_FEED_KEYS: tuple[str, ...] = tuple(FEED_URLS)
+# One long-lived pool, sized to the number of feeds (3). Reusing it avoids
+# spinning up and tearing down threads on every refresh — meaningful on a
+# 512 MB Pi. Threads are daemonic by default in ThreadPoolExecutor.
+_FEED_POOL = ThreadPoolExecutor(max_workers=len(_FEED_KEYS), thread_name_prefix="mta-feed")
+
+
 def fetch_all_subway_feeds(timeout: float = 10.0) -> dict[str, gtfs_realtime_pb2.FeedMessage]:
-    """Download every subway feed we care about, at most once each."""
-    return {k: fetch_feed(k, timeout=timeout) for k in FEED_URLS}
+    """Download every subway feed we care about, in parallel (I/O-bound).
 
-
-def _direction_from_stop_id(stop_id: str) -> str:
-    return stop_id[-1] if stop_id[-1:] in ("N", "S") else "?"
-
-
-def _parent_stop(stop_id: str) -> str:
-    return stop_id[:-1] if stop_id[-1:] in ("N", "S") else stop_id
+    Each feed is a separate HTTPS call; fetching them concurrently collapses
+    total wall time to roughly ``max(feed latency)`` instead of the sum.
+    """
+    feeds = _FEED_POOL.map(lambda k: fetch_feed(k, timeout=timeout), _FEED_KEYS)
+    return dict(zip(_FEED_KEYS, feeds))
 
 
 def extract_departures(
@@ -193,8 +214,9 @@ def extract_departures(
       * predictions already in the past or below MIN_MINUTES_ACHIEVABLE
     """
     now = int(time.time()) if now_epoch is None else now_epoch
-    allowed_stops = set(parent_stop_ids)
-    allowed_routes = set(routes)
+    allowed_stops = frozenset(parent_stop_ids)
+    allowed_routes = frozenset(routes)
+    min_future_epoch = now + MIN_MINUTES_ACHIEVABLE * 60
     out: list[Departure] = []
 
     for entity in feed.entity:
@@ -206,25 +228,25 @@ def extract_departures(
             continue
 
         for stu in trip.stop_time_update:
-            if _parent_stop(stu.stop_id) not in allowed_stops:
+            stop_id = stu.stop_id
+            # Parent-stop check inlined to avoid a function call per update.
+            suffix = stop_id[-1:]
+            parent = stop_id[:-1] if suffix in ("N", "S") else stop_id
+            if parent not in allowed_stops:
                 continue
 
             # Prefer `departure.time`, fall back to `arrival.time` (0 = unset).
             when = (stu.departure.time if stu.HasField("departure") else 0) \
                 or (stu.arrival.time if stu.HasField("arrival") else 0)
-            if when <= now:
-                continue
-
-            minutes = (when - now) // 60
-            if minutes < MIN_MINUTES_ACHIEVABLE:
+            if when < min_future_epoch:
                 continue
 
             out.append(Departure(
                 route_id=route_id,
-                stop_id=stu.stop_id,
-                direction=_direction_from_stop_id(stu.stop_id),
+                stop_id=stop_id,
+                direction=suffix if suffix in ("N", "S") else "?",
                 arrival_epoch=when,
-                minutes_away=minutes,
+                minutes_away=(when - now) // 60,
             ))
 
     out.sort(key=lambda d: d.arrival_epoch)

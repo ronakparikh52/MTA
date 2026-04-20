@@ -74,9 +74,11 @@ def suggested_focus(now_local: datetime | None = None) -> SuggestedFocus:
 # Bloomberg commute screen
 # ---------------------------------------------------------------------------
 
-_BLOOMBERG_UPTOWN_ONLY = True
-_BLOOMBERG_E_STOP = ("A25",)    # 50 St / 8 Av
-_BLOOMBERG_NRW_STOP = ("R16",)  # 49 St / 7 Av (no Q)
+# (feed_key, parent_stops, routes, display_route_id) for each Bloomberg row.
+_BLOOMBERG_SOURCES: tuple[tuple[str, tuple[str, ...], tuple[str, ...], str], ...] = (
+    ("ACE",  ("A25",), ("E",),                "E"),    # 50 St / 8 Av
+    ("NQRW", ("R16",), ("N", "R", "W"),       "NRW"),  # 49 St / 7 Av (no Q)
+)
 
 
 def _aggregate_uptown(
@@ -85,27 +87,29 @@ def _aggregate_uptown(
 ) -> Departure | None:
     """Return one uptown row (soonest + next soonest) across all given routes.
 
-    `full` is assumed to be sorted ascending by `arrival_epoch` (as produced
-    by `mta_api.extract_departures`). We pick the first two departures with
-    direction "N", collapse them into one row tagged as `display_route_id`.
+    `full` is assumed sorted ascending by `arrival_epoch`. Does a single pass
+    and stops after finding the first two uptown departures.
     """
-    uptown = [d for d in full if d.direction == "N"]
-    if not uptown:
+    first: Departure | None = None
+    for d in full:
+        if d.direction != "N":
+            continue
+        if first is None:
+            first = d
+        else:
+            return replace(first, route_id=display_route_id, next_train_minutes=d.minutes_away)
+    if first is None:
         return None
-    first = uptown[0]
-    nxt = uptown[1].minutes_away if len(uptown) > 1 else None
-    return replace(first, route_id=display_route_id, next_train_minutes=nxt)
+    return replace(first, route_id=display_route_id, next_train_minutes=None)
 
 
 def get_bloomberg_commute_rows(
     feed_cache: dict[str, gtfs_realtime_pb2.FeedMessage],
 ) -> list[Departure]:
     """Uptown E @ A25 + uptown combined N/R/W @ R16 (two times per line)."""
-    e_deps = extract_departures(feed_cache["ACE"], _BLOOMBERG_E_STOP, ("E",))
-    nrw_deps = extract_departures(feed_cache["NQRW"], _BLOOMBERG_NRW_STOP, ("N", "R", "W"))
-
     rows: list[Departure] = []
-    for deps, label in ((e_deps, "E"), (nrw_deps, "NRW")):
+    for feed_key, stops, routes, label in _BLOOMBERG_SOURCES:
+        deps = extract_departures(feed_cache[feed_key], stops, routes)
         row = _aggregate_uptown(deps, label)
         if row is not None:
             rows.append(row)
