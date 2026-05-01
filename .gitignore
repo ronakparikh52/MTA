@@ -7,6 +7,10 @@ __pycache__/
 .env
 .env.*
 !.env.example
+
+# CircuitPython device config (real WiFi creds live here, never commit)
+frontend/settings.toml
+!frontend/settings.toml.example
 .DS_Store
 .idea/
 .vscode/

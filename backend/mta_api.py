@@ -2,10 +2,10 @@
 mta_api.py
 ----------
 Live NYC subway departures from the MTA's free GTFS-Realtime feeds, returned
-as simple `Departure` records plus helpers to format them for a terminal or
-a hardware display.
+as simple `Departure` records. This module is JSON/data only — formatting
+(colors, fonts, layout) is the frontend's job.
 
-How it works:
+Pipeline:
   1. The MTA publishes each line group as a protobuf feed over HTTPS.
   2. `fetch_feed` downloads one feed; `gtfs-realtime-bindings` decodes it.
   3. `extract_departures` walks the feed and keeps predictions that match a
@@ -19,8 +19,6 @@ No API key is required.
 
 from __future__ import annotations
 
-import os
-import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
@@ -80,95 +78,15 @@ class Departure:
     next_train_minutes: int | None = None  # following train at same stop+dir
 
 
-# Module-level tables so direction helpers don't rebuild a dict per call.
-_DIRECTION_LABELS = {"N": "Uptown", "S": "Downtown"}
-_DIRECTION_LETTERS = {"N": "U", "S": "D"}
-
-
-def direction_label(direction: str) -> str:
-    """Long label: 'Uptown' / 'Downtown'."""
-    return _DIRECTION_LABELS.get(direction, direction)
-
-
-def direction_letter(direction: str) -> str:
-    """Short label: 'U' / 'D'."""
-    return _DIRECTION_LETTERS.get(direction, direction)
-
-
-# ---------------------------------------------------------------------------
-# Formatting
-# ---------------------------------------------------------------------------
-
-def format_departure_pipes(d: Departure, *, missing_next: str = "—") -> str:
-    """Hardware-friendly row: ``LINE | Direction | min | next_min |``."""
-    nxt = d.next_train_minutes if d.next_train_minutes is not None else missing_next
-    return f"{d.route_id} | {direction_label(d.direction)} | {d.minutes_away} | {nxt} |"
-
-
-# Approximate official NYC subway route colors (RGB).
-_LINE_COLORS: dict[str, tuple[int, int, int]] = {
-    # 8 Av (blue)
-    "A": (0, 57, 166), "C": (0, 57, 166), "E": (0, 57, 166),
-    # 6 Av (orange)
-    "B": (255, 99, 27), "D": (255, 99, 27), "F": (255, 99, 27), "M": (255, 99, 27),
-    # Broadway (yellow), plus the aggregated "NRW" badge
-    "N": (252, 204, 10), "Q": (252, 204, 10), "R": (252, 204, 10), "W": (252, 204, 10),
-    "NRW": (252, 204, 10),
-    # IRT reds / greens / purple
-    "1": (238, 53, 63), "2": (238, 53, 63), "3": (238, 53, 63),
-    "4": (0, 147, 69),  "5": (0, 147, 69),  "6": (0, 147, 69),
-    "7": (116, 44, 148),
-    # Misc
-    "G": (108, 190, 69),
-    "J": (153, 102, 51), "Z": (153, 102, 51),
-    "L": (167, 169, 172),
-    "S": (128, 128, 128), "H": (128, 128, 128),
-}
-_DEFAULT_LINE_COLOR = (180, 180, 180)
-
-
-def line_rgb(route_id: str) -> tuple[int, int, int]:
-    """Return (r, g, b) for a route. Used by terminal color + hardware rendering."""
-    return _LINE_COLORS.get(route_id.upper(), _DEFAULT_LINE_COLOR)
-
-
-def terminal_color_enabled() -> bool:
-    """True when printing to a real terminal without NO_COLOR set."""
-    return sys.stdout.isatty() and "NO_COLOR" not in os.environ
-
-
-def format_departure_terminal(
-    d: Departure,
-    *,
-    missing_next: str = "—",
-    use_color: bool | None = None,
-    route_width: int = 4,
-) -> str:
-    """One terminal row: colored route badge, U/D, then two minute columns."""
-    if use_color is None:
-        use_color = terminal_color_enabled()
-
-    nxt = d.next_train_minutes if d.next_train_minutes is not None else missing_next
-    width = max(route_width, len(d.route_id))
-    route = f"{d.route_id:<{width}}"
-    if use_color:
-        r, g, b = line_rgb(d.route_id)
-        # Single combined SGR sequence = one fewer escape pair per row.
-        route = f"\033[1;38;2;{r};{g};{b}m{route}\033[0m"
-
-    return f"  {route}  {direction_letter(d.direction)}   {d.minutes_away:>2}   {nxt:>2}"
-
-
 # ---------------------------------------------------------------------------
 # Fetch + parse
 # ---------------------------------------------------------------------------
 
 # Shared HTTP session: one TCP+TLS connection stays warm between polls, which
 # is the single biggest win on a Pi Zero 2 W where TLS handshakes are costly.
-# `requests` keeps a connection pool per host when you reuse a Session.
 _SESSION = requests.Session()
 _SESSION.headers.update({
-    "Accept-Encoding": "gzip, deflate",  # MTA gzips feeds; saves bandwidth + CPU.
+    "Accept-Encoding": "gzip, deflate",
     "User-Agent": "mta-led-sign/1.0",
 })
 
@@ -183,18 +101,12 @@ def fetch_feed(feed_key: str, timeout: float = 10.0) -> gtfs_realtime_pb2.FeedMe
 
 
 _FEED_KEYS: tuple[str, ...] = tuple(FEED_URLS)
-# One long-lived pool, sized to the number of feeds (3). Reusing it avoids
-# spinning up and tearing down threads on every refresh — meaningful on a
-# 512 MB Pi. Threads are daemonic by default in ThreadPoolExecutor.
+# Long-lived pool, sized to the number of feeds. Reused across refreshes.
 _FEED_POOL = ThreadPoolExecutor(max_workers=len(_FEED_KEYS), thread_name_prefix="mta-feed")
 
 
 def fetch_all_subway_feeds(timeout: float = 10.0) -> dict[str, gtfs_realtime_pb2.FeedMessage]:
-    """Download every subway feed we care about, in parallel (I/O-bound).
-
-    Each feed is a separate HTTPS call; fetching them concurrently collapses
-    total wall time to roughly ``max(feed latency)`` instead of the sum.
-    """
+    """Download every subway feed we care about, in parallel (I/O-bound)."""
     feeds = _FEED_POOL.map(lambda k: fetch_feed(k, timeout=timeout), _FEED_KEYS)
     return dict(zip(_FEED_KEYS, feeds))
 
@@ -229,7 +141,6 @@ def extract_departures(
 
         for stu in trip.stop_time_update:
             stop_id = stu.stop_id
-            # Parent-stop check inlined to avoid a function call per update.
             suffix = stop_id[-1:]
             parent = stop_id[:-1] if suffix in ("N", "S") else stop_id
             if parent not in allowed_stops:
@@ -318,28 +229,3 @@ def get_all_departures(*, per_route_direction: int = 1) -> dict[str, list[Depart
     return get_all_departures_from_feed_cache(
         fetch_all_subway_feeds(), per_route_direction=per_route_direction,
     )
-
-
-# ---------------------------------------------------------------------------
-# CLI preview
-# ---------------------------------------------------------------------------
-
-def print_departures(results: dict[str, list[Departure]]) -> None:
-    """Print one colored row per departure, grouped by station section."""
-    for group_name, deps in results.items():
-        print(f"\n=== {group_name} ===")
-        if not deps:
-            print("  (no upcoming departures in feed)")
-            continue
-        print("  line   dir   1st  2nd")
-        for d in deps:
-            print(format_departure_terminal(d))
-
-
-if __name__ == "__main__":
-    print("Fetching live MTA GTFS-Realtime data...")
-    try:
-        print_departures(get_all_departures())
-    except requests.RequestException as exc:
-        print(f"Network error talking to MTA: {exc}")
-        raise SystemExit(1)

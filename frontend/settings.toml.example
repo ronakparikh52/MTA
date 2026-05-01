@@ -1,0 +1,27 @@
+# settings.toml -- copy this to the root of the CIRCUITPY drive on the
+# Matrix Portal S3, then fill in your real values. CircuitPython 8+ reads
+# this on boot and exposes each entry via os.getenv().
+#
+# Do NOT commit a settings.toml with real WiFi credentials — that's why
+# this is the .example template and the live file is in .gitignore.
+
+# WiFi (CIRCUITPY_* names are recognized by CircuitPython natively, so the
+# device connects before code.py even runs in some workflows).
+CIRCUITPY_WIFI_SSID = "your-wifi-name"
+CIRCUITPY_WIFI_PASSWORD = "your-wifi-password"
+
+# URL of the backend Flask app on the Pi. Use the Pi's LAN IP, not its
+# hostname — CircuitPython's DNS resolver is flaky over mDNS.
+BACKEND_URL = "http://192.168.1.42:5001/matrix"
+
+# How often to fetch fresh data and how often to advance to the next page.
+# 30s polling matches the backend's default cache TTL (always a fresh hit).
+POLL_SECONDS = "30"
+PAGE_SECONDS = "10"
+
+# Local-timezone offset from UTC, in whole hours. Used by the morning-
+# commute focus rule (Mon-Fri 7:00-12:00 LOCAL). CircuitPython has no
+# `zoneinfo`, so DST has to be flipped manually:
+#   "-4" = America/New_York during EDT  (mid-Mar through early Nov)
+#   "-5" = America/New_York during EST  (rest of the year)
+LOCAL_TZ_OFFSET_HOURS = "-4"
